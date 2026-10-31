@@ -16,3 +16,4 @@ from tkinter font as tkfont
 
 speech_recognition as sr
 pyttsx3
+pillow
