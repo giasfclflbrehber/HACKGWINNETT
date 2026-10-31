@@ -1,4 +1,5 @@
 # HACKGWINNETT
+#Beginner AI
 Medical care Voice Navigator
 
 A voice app that helps people with disabilities find their way around medical care. You talk, it talks back.
