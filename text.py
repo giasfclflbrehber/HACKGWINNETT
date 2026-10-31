@@ -1,17 +1,38 @@
+"""
+Medicare Navigator - voice app with a window (GUI). One file.
+
+Run it:
+    pip install SpeechRecognition pyttsx3 pyaudio
+    python medicare_navigator_combined.py
+
+Layout of this file:
+    1. Imports and settings
+    2. Window plumbing + speaking and listening   (changed: now talks to the window)
+    3. Your original logic                        (same as before, 5 small edits
+                                                   marked with  # GUI:  comments)
+    4. The window itself (tkinter)
+    5. main() - starts the logic thread and the window
+"""
+import gc
 import html
 import json
 import os
+import queue
 import re
+import threading
+import time
+import tkinter as tk
 import xml.etree.ElementTree as ET
 import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import date
+from tkinter import font as tkfont
 
 import speech_recognition as sr
 import pyttsx3
 
-engine = pyttsx3.init()
+engine = None  # created inside the logic thread (see run_logic)
 recognizer = sr.Recognizer()
 
 PROFILE_FILE = "profile.json"
@@ -23,38 +44,161 @@ last_url = None  # the website from the most recent condition lookup
 current_page = "menu"
 history = []
 
+# =====================================================================
+# WINDOW PLUMBING
+# =====================================================================
+# The window and the app logic run in two different threads (like two
+# Java threads). They talk through queues, which are thread-safe mailboxes.
+
+ui_queue = queue.Queue()      # logic  -> window  (things to display)
+typed_queue = queue.Queue()   # window -> logic   (typed text, button clicks)
+voice_queue = queue.Queue()   # microphone -> logic (what was heard)
+
+SERVICE_ERROR = "__service_error__"
+SKIP = "skip"
+
+speaking = threading.Event()   # set while the app is talking
+mute_until = 0.0               # ignore the microphone until this time
+mic_ready = False
+skip_requested = False
+
+
+def ui_event(kind, data=None):
+    ui_queue.put((kind, data))
+
+
 # ---------- Speaking and listening ----------
 
 def speak(message):
-    global last_message
+    global last_message, mute_until
     last_message = message
     print("App:", message)
-    engine.say(message)
-    engine.runAndWait()
+    ui_event("say", message)          # GUI: show it on screen too
+    ui_event("status", "Speaking")
+    speaking.set()
+    try:
+        engine.say(message)
+        engine.runAndWait()
+    finally:
+        speaking.clear()
+        mute_until = time.time() + 0.7   # don't hear our own voice
+    ui_event("status", "Ready")
 
-def listen():
-    with sr.Microphone() as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
-        print("Listening...")
+
+def on_audio(rec, audio):
+    """Called by the microphone each time it captures a phrase."""
+    if speaking.is_set() or time.time() < mute_until:
+        return
+    try:
+        text = rec.recognize_google(audio).lower()
+    except sr.UnknownValueError:
+        return
+    except sr.RequestError:
+        voice_queue.put(SERVICE_ERROR)
+        return
+    voice_queue.put(text)
+
+
+def start_microphone():
+    global mic_ready
+    try:
+        mic = sr.Microphone()
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+        recognizer.listen_in_background(mic, on_audio, phrase_time_limit=8)
+        mic_ready = True
+    except Exception as err:
+        print("Microphone problem:", err)
+        ui_event("system", "I can't use the microphone right now. "
+                           "You can type or tap the buttons instead.")
+
+
+def drain(q):
+    while True:
         try:
-            audio = recognizer.listen(source, timeout=10, phrase_time_limit=8)
-            text = recognizer.recognize_google(audio).lower()
-            print("You said:", text)
-            return text
-        except (sr.WaitTimeoutError, sr.UnknownValueError):
-            return ""
-        except sr.RequestError:
-            speak("I can't reach the speech service. Check your internet.")
-            return ""
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def wait_for_input(timeout):
+    """Wait for typed text OR a voice phrase. Returns None on timeout."""
+    end = None if timeout is None else time.time() + timeout
+    while True:
+        for q in (typed_queue, voice_queue):
+            try:
+                return q.get_nowait()
+            except queue.Empty:
+                pass
+        if end is not None and time.time() > end:
+            return None
+        time.sleep(0.05)
+
+
+def listen(main=False):
+    """Hears speech, typing, or a button click - whichever comes first."""
+    global skip_requested
+    skip_requested = False
+    ui_event("mode", "menu" if main else "question")
+    drain(voice_queue)
+    ui_event("status", "Listening" if mic_ready else "Ready")
+
+    item = wait_for_input(10)
+    if item is None:                       # nobody said anything
+        ui_event("status", "Ready")
+        return ""
+
+    ui_event("mode", "busy")
+    if item == SERVICE_ERROR:
+        ui_event("status", "Error")
+        speak("I can't reach the speech service. Check your internet.")
+        return ""
+
+    text = item.strip().lower()
+    print("You said:", text)
+    ui_event("heard", text)
+    if text == SKIP:
+        skip_requested = not main
+        return ""
+    ui_event("status", "Thinking")
+    return text
+
+
+def type_fallback():
+    """Used when we couldn't hear an answer. Waits for typing, speech, or Skip."""
+    global skip_requested
+    if skip_requested:                     # Skip was already pressed
+        skip_requested = False
+        return ""
+    ui_event("mode", "question")
+    ui_event("system", "I couldn't hear you. Say it again, type your "
+                       "answer below, or press Skip.")
+    ui_event("status", "Listening" if mic_ready else "Ready")
+    while True:
+        item = wait_for_input(None)
+        if item != SERVICE_ERROR:
+            break
+    ui_event("mode", "busy")
+    text = item.strip().lower()
+    ui_event("heard", text)
+    return "" if text == SKIP else text
+
+
+# =====================================================================
+# YOUR APP LOGIC
+# =====================================================================
 
 def words(text):
     return set(re.findall(r"[a-z']+", text.lower()))
 
+
 def yes(text):
     return bool(words(text) & {"yes", "yeah", "yep", "correct", "right", "sure"})
 
+
 def no(text):
     return bool(words(text) & {"no", "nope", "wrong", "incorrect"})
+
 
 # ---------- Saved information ----------
 
@@ -64,18 +208,22 @@ def load_profile():
             return json.load(f)
     return {}
 
+
 def save_profile(profile):
     with open(PROFILE_FILE, "w") as f:
         json.dump(profile, f, indent=2)
+
 
 # ---------- Turning speech into values ----------
 
 def parse_name(text):
     return text.strip().title() or None
 
+
 def parse_year(text):
     m = re.search(r"\b(19|20)\d{2}\b", text)
     return int(m.group()) if m else None
+
 
 def parse_yes_no(text):
     if yes(text):
@@ -84,6 +232,7 @@ def parse_yes_no(text):
         return False
     return None
 
+
 def parse_month_year(text):
     year = re.search(r"\b(19|20)\d{2}\b", text)
     month = next((i + 1 for i, m in enumerate(MONTHS) if m in text), None)
@@ -91,17 +240,21 @@ def parse_month_year(text):
         return f"{year.group()}-{month:02d}"
     return None
 
+
 def show_month_year(value):
     year, month = value.split("-")
     return f"{MONTHS[int(month) - 1].title()} {year}"
 
+
 def show_yes_no(value):
     return "yes" if value else "no"
+
 
 def add_months(value, n):
     year, month = map(int, value.split("-"))
     total = year * 12 + (month - 1) + n
     return total // 12, total % 12 + 1
+
 
 def parse_full_date(text):
     year_match = re.search(r"\b(20\d{2})\b", text)
@@ -116,8 +269,10 @@ def parse_full_date(text):
     except ValueError:
         return None
 
+
 def show_full_date(d):
     return f"{MONTHS[d.month - 1].title()} {d.day}, {d.year}"
+
 
 # ---------- Asking for information by voice ----------
 
@@ -127,8 +282,7 @@ def ask_field(question, parser, show=str):
         speak(question)
         answer = listen()
         if not answer:
-            answer = input("I couldn't hear you. Type your answer, "
-                           "or press Enter to skip: ").strip().lower()
+            answer = type_fallback().strip().lower()   # GUI: was input(...)
             if not answer:
                 return None
         value = parser(answer)
@@ -141,7 +295,9 @@ def ask_field(question, parser, show=str):
     speak("Let's skip that one for now.")
     return None
 
+
 def collect_profile():
+    ui_event("page", "info")                           # GUI: update the header
     profile = load_profile()
     speak("Let's set up your information. You can skip any question by staying quiet.")
 
@@ -167,6 +323,7 @@ def collect_profile():
     save_profile(profile)
     speak("Saved. Say deadlines to see your timeline.")
 
+
 def read_profile():
     profile = load_profile()
     if not profile:
@@ -184,6 +341,7 @@ def read_profile():
         parts.append(f"They started in {show_month_year(profile['ssdi_start'])}.")
     speak(" ".join(parts))
 
+
 def delete_profile():
     speak("Do you want me to delete all your saved information? Say yes or no.")
     if yes(listen()):
@@ -192,6 +350,7 @@ def delete_profile():
         speak("Your information is deleted.")
     else:
         speak("Okay, I kept it.")
+
 
 # ---------- Letters ----------
 
@@ -250,6 +409,7 @@ LETTER_HELP = {
     ],
 }
 
+
 def parse_letter_type(text):
     if any(w in text for w in ["not sure", "don't know", "dont know", "unknown", "no idea"]):
         return "unknown"
@@ -266,6 +426,7 @@ def parse_letter_type(text):
     if any(w in text for w in ["enrollment", "premium", "penalty", "welcome"]):
         return "enrollment"
     return None
+
 
 def letters():
     speak("Let's go through your letter.")
@@ -298,6 +459,7 @@ def letters():
     else:
         speak(f"You have {days_left} days left. Try to act well before then.")
 
+
 # ---------- Plans ----------
 
 PLAN_QUESTIONS = [
@@ -321,6 +483,7 @@ PLAN_TIPS = {
                   "drug costs or Medicare Savings Programs. Ask a state health "
                   "insurance counselor, or call 1 800 633 4227.",
 }
+
 
 def plans():
     speak("I will ask a few quick questions to help you think about plan types. "
@@ -347,6 +510,7 @@ def plans():
     speak("If you are under 65, you may have fewer supplement plan choices in "
           "some states. A free state health insurance counselor can explain "
           "your options. You can also compare plans at medicare dot gov.")
+
 
 # ---------- Learn about my condition ----------
 
@@ -540,11 +704,13 @@ SOURCE_URLS = {
 MEDICARE_NOTE = {"als", "kidney"}
 MEDICARE_URL = "https://www.medicare.gov"
 
+
 def mentions(text, alias):
     # Short aliases like "ms" or "als" must match a whole word.
     if " " in alias or len(alias) >= 5:
         return alias in text
     return alias in words(text)
+
 
 def parse_condition(text):
     text = re.sub(r"^(i have|i've got|i got|learn about|tell me about|about|my)\s+",
@@ -554,9 +720,11 @@ def parse_condition(text):
             return ("saved", key)
     return ("online", text) if text else None
 
+
 def show_condition(value):
     kind, val = value
     return CONDITIONS[val]["name"] if kind == "saved" else val
+
 
 def web_get(url):
     req = urllib.request.Request(
@@ -564,15 +732,18 @@ def web_get(url):
     with urllib.request.urlopen(req, timeout=8) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+
 def web_get_raw(url):
     req = urllib.request.Request(
         url, headers={"User-Agent": "MedicareVoiceNavigator/1.0 (student project)"})
     with urllib.request.urlopen(req, timeout=8) as resp:
         return resp.read()
 
+
 def clean_text(value):
     value = re.sub(r"<[^>]+>", " ", value or "")
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
 
 def parse_medlineplus(xml_bytes):
     """Pull title, short summary, and page link from a MedlinePlus response."""
@@ -594,6 +765,7 @@ def parse_medlineplus(xml_bytes):
         short += (" " if short else "") + s
     return (title, short or sentences[0], url)
 
+
 def lookup_medlineplus(term):
     """Look up a health topic on MedlinePlus. Returns (title, summary, url) or None."""
     try:
@@ -602,6 +774,7 @@ def lookup_medlineplus(term):
         return parse_medlineplus(web_get_raw(url))
     except Exception:
         return None
+
 
 def lookup_online(term):
     """Get a short summary from Wikipedia. Returns (title, summary, url) or None."""
@@ -622,6 +795,7 @@ def lookup_online(term):
     except Exception:
         return None
 
+
 def open_website(url):
     print("Link:", url)
     try:
@@ -635,9 +809,11 @@ def open_website(url):
         speak("I couldn't open the browser, but the link is in the window "
               "where this app is running.")
 
+
 def offer_website(url):
     global last_url
     last_url = url
+    ui_event("link", url)                              # GUI: show the website bar
     print("Link:", url)
     speak("Do you want me to open the website for more information? "
           "Say yes or no. You can also say open the website later.")
@@ -645,11 +821,13 @@ def offer_website(url):
     if yes(answer) or any(p in answer for p in ["open", "take me", "go to"]):
         open_website(url)
 
+
 def website_command():
     if last_url:
         open_website(last_url)
     else:
         speak("I don't have a website yet. Say learn about my condition first.")
+
 
 def condition_info():
     speak("I can share general information about a health condition. "
@@ -696,11 +874,13 @@ def condition_info():
           "knows your situation best.")
     offer_website(url)
 
+
 # ---------- Pages ----------
 
 def menu():
     speak("You can say deadlines, plans, letters, learn about my condition, "
           "set up my info, open the website, or help. Say quit to stop.")
+
 
 def deadlines():
     profile = load_profile()
@@ -714,22 +894,28 @@ def deadlines():
           "Some conditions, like ALS, start sooner. "
           "Check medicare.gov or call 1 800 633 4227 to confirm your date.")
 
+
 PAGES = {"menu": menu, "deadlines": deadlines, "plans": plans,
          "letters": letters, "condition": condition_info}
 
+
 def go_to(page):
     global current_page
+    ui_event("page", page)                             # GUI: update the header
     history.append(current_page)
     current_page = page
     PAGES[page]()
+
 
 def go_back():
     global current_page
     if history:
         current_page = history.pop()
+        ui_event("page", current_page)                 # GUI: update the header
         PAGES[current_page]()
     else:
         speak("You are already at the start.")
+
 
 # ---------- Commands ----------
 
@@ -763,16 +949,461 @@ def handle(text):
     else:
         speak("Sorry, I didn't catch that. Say help to hear your options.")
 
-def main():
+
+def run_logic():
+    """Your old main() loop. It now runs in a background thread."""
+    global engine
+    engine = pyttsx3.init()    # create the voice in THIS thread (some systems require it)
+    start_microphone()
     speak("Welcome to the Medicare navigator.")
+    ui_event("page", "menu")
     menu()
     while True:
-        text = listen()
+        text = listen(main=True)
         if "quit" in text or "exit" in text:
             speak("Goodbye.")
+            ui_event("quit")
             break
         if text:
-            handle(text)
+            try:
+                handle(text)
+            except Exception as err:
+                print("Error:", err)
+                ui_event("system", f"Something went wrong: {err}")
+                speak("Sorry, something went wrong. Say help to hear your options.")
+
+
+# =====================================================================
+# THE WINDOW
+# =====================================================================
+
+P = {
+    "sidebar": "#0F2742", "sidebar_hover": "#1B3A63", "sidebar_text": "#FFFFFF",
+    "sidebar_muted": "#A9BDD6", "sidebar_disabled": "#6E88A6",
+    "accent": "#2563EB", "accent_light": "#8CB8FF",
+    "bg": "#F1F5F9", "card": "#FFFFFF", "text": "#0F172A", "muted": "#475569",
+    "border": "#CBD5E1", "app_bubble": "#E0ECFF", "user_bubble": "#D1FAE5",
+    "link_bg": "#EFF6FF", "focus": "#FBBF24",
+}
+
+# Status colors. Each status also has a word, so color is never the only clue.
+STATUS = {
+    "Ready": "#475569",
+    "Listening": "#15803D",
+    "Speaking": "#1D4ED8",
+    "Thinking": "#B45309",
+    "Error": "#B91C1C",
+}
+
+PAGE_INFO = {
+    "menu": ("Home", "Say what you need, or tap a topic on the left."),
+    "deadlines": ("Deadlines", "Your Medicare timeline."),
+    "plans": ("Plans", "Think through which type of plan may fit you."),
+    "letters": ("Letters", "Understand a letter you received."),
+    "condition": ("Learn about a condition",
+                  "General information only. Not medical advice."),
+    "info": ("My info", "Saved only on this computer."),
+}
+
+# (page key, button label, text sent exactly as if you had said it)
+NAV = [
+    ("menu", "Home", "menu"),
+    ("deadlines", "Deadlines", "deadlines"),
+    ("plans", "Plans", "plans"),
+    ("letters", "Letters", "letters"),
+    ("condition", "Learn about a condition", "learn about my condition"),
+    ("info", "Set up my info", "set up my info"),
+    ("read", "Read my saved info", "what do you know about me"),
+]
+
+BASE_SIZE = 15
+# font name: (size offset, bold?)
+FONT_SPECS = {
+    "small": (-3, False), "body": (0, False), "nav": (0, True),
+    "button": (0, True), "big": (7, False), "title": (15, True),
+    "brand": (7, True),
+}
+
+
+class FlatButton(tk.Label):
+    """A modern flat button (also works with Tab + Enter/Space for keyboard users)."""
+
+    def __init__(self, parent, text, command, font, bg, fg, hover_bg,
+                 disabled_fg="#94A3B8", disabled_bg=None,
+                 anchor="center", padx=16, pady=10):
+        super().__init__(parent, text=text, font=font, bg=bg, fg=fg,
+                         anchor=anchor, padx=padx, pady=pady, cursor="hand2",
+                         takefocus=1, highlightthickness=2,
+                         highlightbackground=bg, highlightcolor=P["focus"])
+        self.command = command
+        self.base_bg = bg
+        self.fg_on = fg
+        self.hover_bg = hover_bg
+        self.disabled_fg = disabled_fg
+        self.disabled_bg = disabled_bg
+        self.enabled = True
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", lambda e: self._apply())
+        self.bind("<Button-1>", self.invoke)
+        self.bind("<Return>", self.invoke)
+        self.bind("<space>", self.invoke)
+
+    def _apply(self):
+        if self.enabled:
+            bg, fg, cursor = self.base_bg, self.fg_on, "hand2"
+        else:
+            bg = self.disabled_bg or self.base_bg
+            fg, cursor = self.disabled_fg, "arrow"
+        self.configure(bg=bg, fg=fg, cursor=cursor, highlightbackground=bg,
+                       takefocus=1 if self.enabled else 0)
+
+    def _on_enter(self, _event):
+        if self.enabled:
+            self.configure(bg=self.hover_bg, highlightbackground=self.hover_bg)
+
+    def invoke(self, _event=None):
+        if self.enabled and self.command:
+            self.command()
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        self._apply()
+
+    def set_base_bg(self, bg):
+        self.base_bg = bg
+        self._apply()
+
+
+class NavigatorApp:
+    def __init__(self, root):
+        self.root = root
+        self.status = "Ready"
+        self.pulse_big = False
+        self.scale = 0
+        self.link_url = None
+
+        root.title("Medicare Navigator")
+        root.geometry("1180x780")
+        root.minsize(980, 680)
+        root.configure(bg=P["bg"])
+        root.columnconfigure(0, minsize=260)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        family = self.pick_family()
+        self.fonts = {
+            name: tkfont.Font(family=family, size=BASE_SIZE + off,
+                              weight="bold" if bold else "normal")
+            for name, (off, bold) in FONT_SPECS.items()
+        }
+
+        self.nav_buttons = {}
+        self.command_buttons = []   # work only at the main menu
+        self.answer_buttons = []    # work only while a question is open
+
+        self.build_sidebar()
+        self.build_main()
+        self.set_mode("busy")
+        self.set_page("menu")
+
+        self.entry.focus_set()
+        self.root.after(80, self.poll)
+        self.root.after(500, self.pulse)
+
+    # ---------- small helpers ----------
+    def pick_family(self):
+        available = set(tkfont.families(self.root))
+        for name in ("Segoe UI", "SF Pro Text", "Helvetica Neue",
+                     "Arial", "DejaVu Sans"):
+            if name in available:
+                return name
+        return "Helvetica"
+
+    def make_card(self, parent):
+        return tk.Frame(parent, bg=P["card"], highlightbackground=P["border"],
+                        highlightthickness=1)
+
+    def send(self, text):
+        typed_queue.put(text)
+
+    def submit(self):
+        text = self.entry.get().strip()
+        if text:
+            typed_queue.put(text)
+            self.entry.delete(0, "end")
+
+    # ---------- layout ----------
+    def build_sidebar(self):
+        side = tk.Frame(self.root, bg=P["sidebar"])
+        side.grid(row=0, column=0, sticky="nsew")
+
+        # Bottom group first, so it stays pinned to the bottom.
+        bottom = tk.Frame(side, bg=P["sidebar"])
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(0, 20))
+
+        tk.Label(bottom, text="Text size", font=self.fonts["small"],
+                 bg=P["sidebar"], fg=P["sidebar_muted"], anchor="w"
+                 ).pack(fill="x", padx=6, pady=(0, 6))
+        size_row = tk.Frame(bottom, bg=P["sidebar"])
+        size_row.pack(fill="x")
+        for label, delta in (("A-", -1), ("A+", 1)):
+            FlatButton(size_row, label, lambda d=delta: self.change_text_size(d),
+                       self.fonts["button"], P["sidebar_hover"], P["sidebar_text"],
+                       P["accent"], pady=8
+                       ).pack(side="left", expand=True, fill="x", padx=3)
+        FlatButton(bottom, "Quit", self.root.destroy, self.fonts["button"],
+                   "#991B1B", "#FFFFFF", "#B91C1C", pady=10
+                   ).pack(fill="x", padx=3, pady=(14, 0))
+
+        # Brand
+        tk.Label(side, text="Medicare", font=self.fonts["brand"],
+                 bg=P["sidebar"], fg=P["sidebar_text"], anchor="w"
+                 ).pack(fill="x", padx=22, pady=(28, 0))
+        tk.Label(side, text="Navigator", font=self.fonts["brand"],
+                 bg=P["sidebar"], fg=P["accent_light"], anchor="w"
+                 ).pack(fill="x", padx=22)
+        tk.Label(side, text="Voice-guided help", font=self.fonts["small"],
+                 bg=P["sidebar"], fg=P["sidebar_muted"], anchor="w"
+                 ).pack(fill="x", padx=22, pady=(2, 18))
+
+        # Navigation buttons
+        for key, label, command in NAV:
+            button = FlatButton(
+                side, label, lambda c=command: self.send(c), self.fonts["nav"],
+                P["sidebar"], P["sidebar_text"], P["sidebar_hover"],
+                disabled_fg=P["sidebar_disabled"], anchor="w", padx=18, pady=11)
+            button.pack(fill="x", padx=12, pady=2)
+            self.nav_buttons[key] = button
+
+        tk.Frame(side, bg="#24405F", height=1).pack(fill="x", padx=22, pady=12)
+        FlatButton(side, "Open last website", self.open_link, self.fonts["nav"],
+                   P["sidebar"], P["sidebar_text"], P["sidebar_hover"],
+                   disabled_fg=P["sidebar_disabled"], anchor="w", padx=18, pady=11
+                   ).pack(fill="x", padx=12, pady=2)
+
+    def build_main(self):
+        main = tk.Frame(self.root, bg=P["bg"])
+        main.grid(row=0, column=1, sticky="nsew", padx=28, pady=22)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=1)
+
+        # --- header: page title + status pill ---
+        header = tk.Frame(main, bg=P["bg"])
+        header.grid(row=0, column=0, sticky="ew")
+        titles = tk.Frame(header, bg=P["bg"])
+        titles.pack(side="left")
+        self.title_label = tk.Label(titles, text="", font=self.fonts["title"],
+                                    bg=P["bg"], fg=P["text"], anchor="w")
+        self.title_label.pack(anchor="w")
+        self.hint_label = tk.Label(titles, text="", font=self.fonts["body"],
+                                   bg=P["bg"], fg=P["muted"], anchor="w")
+        self.hint_label.pack(anchor="w")
+
+        self.pill = tk.Frame(header, bg=STATUS["Ready"])
+        self.pill.pack(side="right", anchor="n", pady=6)
+        self.dot = tk.Canvas(self.pill, width=16, height=16, highlightthickness=0,
+                             bg=STATUS["Ready"])
+        self.dot.pack(side="left", padx=(14, 0), pady=9)
+        self.dot_id = self.dot.create_oval(4, 4, 12, 12, fill="white", outline="")
+        self.status_label = tk.Label(self.pill, text="Ready", font=self.fonts["button"],
+                                     bg=STATUS["Ready"], fg="white")
+        self.status_label.pack(side="left", padx=(6, 16), pady=6)
+
+        # --- big "now saying" card ---
+        now_card = self.make_card(main)
+        now_card.grid(row=1, column=0, sticky="ew", pady=(18, 12))
+        tk.Frame(now_card, bg=P["accent"], width=8).pack(side="left", fill="y")
+        inner = tk.Frame(now_card, bg=P["card"])
+        inner.pack(side="left", fill="both", expand=True, padx=22, pady=16)
+        tk.Label(inner, text="THE NAVIGATOR SAYS", font=self.fonts["small"],
+                 bg=P["card"], fg=P["muted"], anchor="w").pack(fill="x")
+        self.now_label = tk.Label(inner, text="Starting up...", font=self.fonts["big"],
+                                  bg=P["card"], fg=P["text"], justify="left",
+                                  anchor="w", wraplength=700)
+        self.now_label.pack(fill="x", pady=(6, 0))
+        inner.bind("<Configure>",
+                   lambda e: self.now_label.configure(wraplength=max(300, e.width - 10)))
+
+        # --- conversation ---
+        log_card = self.make_card(main)
+        log_card.grid(row=2, column=0, sticky="nsew")
+        tk.Label(log_card, text="CONVERSATION", font=self.fonts["small"],
+                 bg=P["card"], fg=P["muted"], anchor="w"
+                 ).pack(fill="x", padx=22, pady=(14, 0))
+        body = tk.Frame(log_card, bg=P["card"])
+        body.pack(fill="both", expand=True)
+        self.log = tk.Text(body, wrap="word", height=6, bg=P["card"], relief="flat",
+                           highlightthickness=0, padx=16, pady=8, state="disabled",
+                           cursor="arrow", takefocus=0, font=self.fonts["body"])
+        scroll = tk.Scrollbar(body, command=self.log.yview)
+        self.log.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.log.tag_configure("app", justify="left", spacing1=6, spacing3=6)
+        self.log.tag_configure("user", justify="right", spacing1=6, spacing3=6)
+        self.log.tag_configure("system", justify="center", spacing1=6, spacing3=6)
+
+        # --- website bar (hidden until a link exists) ---
+        self.link_bar = tk.Frame(main, bg=P["link_bg"], highlightbackground=P["border"],
+                                 highlightthickness=1)
+        tk.Label(self.link_bar, text="More information", font=self.fonts["button"],
+                 bg=P["link_bg"], fg=P["text"]).pack(side="left", padx=(16, 10), pady=10)
+        self.link_label = tk.Label(self.link_bar, text="", font=self.fonts["small"],
+                                   bg=P["link_bg"], fg=P["muted"], anchor="w")
+        self.link_label.pack(side="left", fill="x", expand=True)
+        FlatButton(self.link_bar, "Open website", self.open_link, self.fonts["button"],
+                   P["accent"], "#FFFFFF", "#1D4ED8", pady=6
+                   ).pack(side="right", padx=10, pady=8)
+
+        # --- typing bar ---
+        bar = tk.Frame(main, bg=P["bg"])
+        bar.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        bar.columnconfigure(0, weight=1)
+        self.entry = tk.Entry(bar, font=self.fonts["body"], relief="flat", bg=P["card"],
+                              fg=P["text"], insertbackground=P["text"],
+                              highlightthickness=2, highlightbackground=P["border"],
+                              highlightcolor=P["accent"])
+        self.entry.grid(row=0, column=0, sticky="ew", ipady=10)
+        self.entry.bind("<Return>", lambda e: self.submit())
+        FlatButton(bar, "Send", self.submit, self.fonts["button"], P["accent"],
+                   "#FFFFFF", "#1D4ED8", pady=10
+                   ).grid(row=0, column=1, padx=(10, 0))
+        tk.Label(bar, text="Type a command or an answer and press Enter. "
+                           "You can also just speak.",
+                 font=self.fonts["small"], bg=P["bg"], fg=P["muted"]
+                 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # --- quick buttons ---
+        quick = tk.Frame(main, bg=P["bg"])
+        quick.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        for text, command, colors in (
+            ("Yes", "yes", ("#15803D", "#FFFFFF", "#166534")),
+            ("No", "no", ("#B91C1C", "#FFFFFF", "#991B1B")),
+            ("Skip", SKIP, ("#475569", "#FFFFFF", "#334155")),
+        ):
+            button = FlatButton(quick, text, lambda c=command: self.send(c),
+                                self.fonts["button"], colors[0], colors[1], colors[2],
+                                disabled_bg="#E2E8F0", padx=26)
+            button.pack(side="left", padx=(0, 8))
+            self.answer_buttons.append(button)
+
+        tk.Frame(quick, bg=P["bg"], width=24).pack(side="left")
+        for text, command in (("Repeat", "repeat"), ("Go back", "go back"),
+                              ("Help", "help")):
+            button = FlatButton(quick, text, lambda c=command: self.send(c),
+                                self.fonts["button"], "#E2E8F0", P["text"], "#CBD5E1",
+                                padx=22)
+            button.pack(side="left", padx=(0, 8))
+            self.command_buttons.append(button)
+
+    # ---------- behavior ----------
+    def change_text_size(self, delta):
+        self.scale = max(-2, min(10, self.scale + delta))
+        for name, (offset, _bold) in FONT_SPECS.items():
+            self.fonts[name].configure(size=BASE_SIZE + offset + self.scale)
+
+    def set_status(self, status):
+        self.status = status
+        color = STATUS.get(status, STATUS["Ready"])
+        self.pill.configure(bg=color)
+        self.dot.configure(bg=color)
+        self.status_label.configure(text=status, bg=color)
+
+    def pulse(self):
+        """Makes the dot throb while the app is listening."""
+        if self.status == "Listening":
+            self.pulse_big = not self.pulse_big
+            r = 7 if self.pulse_big else 4
+        else:
+            r = 4
+        self.dot.coords(self.dot_id, 8 - r, 8 - r, 8 + r, 8 + r)
+        self.root.after(500, self.pulse)
+
+    def set_mode(self, mode):
+        menu_on = mode == "menu"
+        question_on = mode == "question"
+        for button in self.nav_buttons.values():
+            button.set_enabled(menu_on)
+        for button in self.command_buttons:
+            button.set_enabled(menu_on)
+        for button in self.answer_buttons:
+            button.set_enabled(question_on)
+
+    def set_page(self, key):
+        title, hint = PAGE_INFO.get(key, PAGE_INFO["menu"])
+        self.title_label.configure(text=title)
+        self.hint_label.configure(text=hint)
+        for nav_key, button in self.nav_buttons.items():
+            button.set_base_bg(P["accent"] if nav_key == key else P["sidebar"])
+
+    def show_link(self, url):
+        self.link_url = url
+        shown = url if len(url) < 70 else url[:67] + "..."
+        self.link_label.configure(text=shown)
+        self.link_bar.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+
+    def open_link(self):
+        if self.link_url:
+            webbrowser.open(self.link_url)
+
+    def add_bubble(self, kind, text):
+        width = max(320, int(self.log.winfo_width() * 0.7))
+        if kind == "system":
+            label = tk.Label(self.log, text=text, font=self.fonts["small"],
+                             bg=P["card"], fg=P["muted"], wraplength=width,
+                             justify="center", padx=8, pady=4)
+        else:
+            bg = P["app_bubble"] if kind == "app" else P["user_bubble"]
+            label = tk.Label(self.log, text=text, font=self.fonts["body"], bg=bg,
+                             fg=P["text"], wraplength=width, justify="left",
+                             padx=16, pady=10)
+        self.log.configure(state="normal")
+        start = self.log.index("end-1c")
+        self.log.window_create("end", window=label)
+        self.log.insert("end", "\n")
+        self.log.tag_add(kind, start, "end-1c")
+        self.log.configure(state="disabled")
+        self.log.see("end")
+
+    # ---------- reading messages from the logic thread ----------
+    def poll(self):
+        try:
+            while True:
+                kind, data = ui_queue.get_nowait()
+                if kind == "say":
+                    self.now_label.configure(text=data)
+                    self.add_bubble("app", data)
+                elif kind == "heard":
+                    self.add_bubble("user", data)
+                elif kind == "system":
+                    self.add_bubble("system", data)
+                elif kind == "status":
+                    self.set_status(data)
+                elif kind == "mode":
+                    self.set_mode(data)
+                elif kind == "page":
+                    self.set_page(data)
+                elif kind == "link":
+                    self.show_link(data)
+                elif kind == "quit":
+                    self.root.after(1200, self.root.destroy)
+        except queue.Empty:
+            pass
+        self.root.after(80, self.poll)
+
+
+# =====================================================================
+# START
+# =====================================================================
+
+def main():
+    root = tk.Tk()
+    NavigatorApp(root)                                   # builds the window
+    threading.Thread(target=run_logic, daemon=True).start()   # starts your logic
+    root.mainloop()                                      # runs the window
+
 
 if __name__ == "__main__":
     main()
+
+
