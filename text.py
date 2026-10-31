@@ -31,6 +31,8 @@ from tkinter import font as tkfont
 
 import speech_recognition as sr
 import pyttsx3
+import pil
+
 
 engine = None  # created inside the logic thread (see run_logic)
 recognizer = sr.Recognizer()
