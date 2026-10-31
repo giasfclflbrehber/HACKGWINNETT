@@ -1,0 +1,18 @@
+gc
+html
+json
+os
+queue
+re
+threading
+time
+tkinter as tk
+xml.etree.ElementTree as ET
+urllib.parse
+urllib.request
+webbrowser
+from datetime date
+from tkinter font as tkfont
+
+speech_recognition as sr
+pyttsx3
