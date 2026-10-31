@@ -1,5 +1,5 @@
 # HACKGWINNETT
-# Beginner AI
+# Beginner AI division
 
 
 
